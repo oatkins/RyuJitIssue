@@ -4,23 +4,23 @@
     using System.Collections.Generic;
     using System.Linq;
     using System.Threading;
-    using System.Threading.Tasks;
     using BenchmarkDotNet.Attributes;
-    using BenchmarkDotNet.Attributes.Jobs;
-    using BenchmarkDotNet.Engines;
-    using BenchmarkDotNet.Running;
-    ////using System.Collections.Concurrent;
-    using BenchmarkDotNet.Jobs;
-    using BenchmarkDotNet.Environments;
     using BenchmarkDotNet.Configs;
-
-    using ServiceStack.Net30.Collections.Concurrent;
+    using BenchmarkDotNet.Environments;
+    using BenchmarkDotNet.Jobs;
+    using BenchmarkDotNet.Running;
 
     public class Program
     {
         static void Main(string[] args)
         {
-            //AddRemoveItemsFromDictionary();
+            // To see the issue in the debugger, uncomment the following two lines
+            // and run a Release build on a machine where RyuJIT is the default
+            // jit compiler.
+
+            ////var p = new Program();
+            ////p.AddRemoveItemsFromDictionary();
+
             var job = Job.Dry
                 .WithEvaluateOverhead(false)
                 .WithInvocationCount(1)
@@ -33,6 +33,9 @@
             var legacyJob = job.With(Jit.LegacyJit);
             var ryuJitJob = job.With(Jit.RyuJit);
 
+            // Using BenchmarkRunner primarily to be able to compare compilers
+            // easily. It's not really a "benchmark". We run two jobs, one of which
+            // (LegacyJIT) completes fast, and the other (RyuJIT) fails.
             BenchmarkRunner.Run<Program>(
                 ManualConfig.Create(DefaultConfig.Instance)
                     .With(legacyJob)
@@ -40,61 +43,90 @@
         }
 
         [Benchmark]
-        public static void AddRemoveItemsFromDictionary()
+        public void AddRemoveItemsFromDictionary()
         {
-            var dic = new ConcurrentDictionary<object, object>();
-            var addedKeys = new System.Collections.Concurrent.ConcurrentStack<object>();
+            const int AddingThreadCount = 1;
+            const int RemovingThreadCount = 10;
 
-            var cts = new CancellationTokenSource();
+            // The ServiceStack ConcurrentDictionary that exhibits the problem.
+            var dic = new ServiceStack.Net30.Collections.Concurrent.ConcurrentDictionary<object, object>();
 
-            var adding = new Thread(
-                new ThreadStart(() =>
-                {
-                    Parallel.For(
-                        0,
-                        100000,
-                        _ =>
+            // A safe .NET object to track the keys currently in the dictionary.
+            var keys = new System.Collections.Concurrent.ConcurrentBag<object>();
+
+            var waitHandles = new List<WaitHandle>();
+
+            int runningAddingThreads = AddingThreadCount;
+
+            // Start adding items to the dictionary. We currently do this on a single
+            // thread, which is enough to reproduce the problem.
+            for (int i = 0; i < AddingThreadCount; i++)
+            {
+                var h = new AutoResetEvent(false);
+                waitHandles.Add(h);
+
+                var t = new Thread(
+                    new ThreadStart(
+                        () =>
                         {
-                            object key = new object();
-                            if (dic.TryAdd(key, key))
+                            for (int ct = 0; ct < 1000; ct++)
                             {
-                                addedKeys.Push(key);
+                                var key = new object();
+                                dic.TryAdd(key, key);
+                                keys.Add(key);
                             }
-                        });
 
-                    cts.Cancel();
-                }));
+                            // When the number of adding threads running reaches zero,
+                            // the removing threads will run only until the dictionary
+                            // is empty.
+                            Interlocked.Decrement(ref runningAddingThreads);
 
-            adding.Start();
-            var token = cts.Token;
+                            h.Set();
+                        }));
 
-            List<Thread> threads = new List<Thread>();
-            for (int tt = 0; tt < 10; tt++)
-            {
-                var thread = new Thread(RemoveThings);
-                thread.Start();
+                // This seems to help us to keep the controlling thread responsive
+                // so that it can kill the crashed threads later.
+                t.Priority = ThreadPriority.BelowNormal;
+                t.IsBackground = true;
 
-                threads.Add(thread);
+                t.Start();
             }
 
-            // Wait for threads to complete.
-            adding.Join(TimeSpan.FromMinutes(5));
-            foreach (var t in threads)
+            // Use several threads to attempt to remove items from the dictionary
+            // concurrently.
+            for (int i = 0; i < RemovingThreadCount; i++)
             {
-                t.Join(1000);
+                var h = new AutoResetEvent(false);
+                waitHandles.Add(h);
+
+                var t = new Thread(
+                    new ThreadStart(
+                        () =>
+                        {
+                            while (runningAddingThreads > 0 || dic.Any())
+                            {
+                                object key;
+                                object value;
+                                if (keys.TryTake(out key))
+                                {
+                                    // This is the line that appears to hang the app when built
+                                    // on RyuJIT.
+                                    dic.TryRemove(key, out value);
+                                }
+                            }
+
+                            h.Set();
+                        }));
+
+                t.Priority = ThreadPriority.BelowNormal;
+                t.IsBackground = true;
+
+                t.Start();
             }
 
-            void RemoveThings()
+            if (!WaitHandle.WaitAll(waitHandles.ToArray(), 10000))
             {
-                while (addedKeys.Any() || !token.IsCancellationRequested)
-                {
-                    object pp;
-                    if (addedKeys.TryPop(out pp))
-                    {
-                        object v;
-                        dic.TryRemove(pp, out v);
-                    }
-                }
+                throw new InvalidOperationException("Test did not complete within 10 seconds.");
             }
         }
     }
